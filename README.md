@@ -24,7 +24,7 @@ The following input arguments are valid:
 | Argument | Inputs |
 | --- | --- |
 | route |[55, 155] |
-| route_time | for 55: '18_56_00' or '13_50_00'; for 155: '13_50_00' or '18_56_00' |
+| route_time | for 55: '18_56_00' or '15_58_00'; for 155: '13_50_00' or '07_44_30' |
 | comp_perc | 0 <= comp_perc <= 1 |
 | num_scenarios | 0 <= num_scenarios <= 40 |
 | walking_distance | [100, 150, 250, 300, 350, 400] |
