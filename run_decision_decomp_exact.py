@@ -88,6 +88,8 @@ def run_decomp(json_files, walking_distance, util_value, seed):
 
         update_scenarios(curr_req, accepted_requests, prev_scenarios, curr_scenario)
 
+        print(f'Updated Scenario')
+
         model = ScenarioDecisionDecomp(prev_scenarios.network,
                                  prev_scenarios.compulsory_stops,
                                  prev_scenarios.scenarios,
@@ -95,9 +97,11 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                  prev_scenarios.requests,
                                  curr_req,
                                  prev_scenarios.deltas,
-                                 prev_scenarios.time_windows)
+                                 prev_scenarios.time_windows,
+                                 145)
 
         for decision in [True, False]:
+            print(f'decision {decision}')
             build_times_scenarios = model.build_models(decision)
             build_times += build_times_scenarios
 
@@ -124,7 +128,8 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                    accepted_requests,
                                    {req: req.utility for req in accepted_requests},
                                    curr_scenario.deltas[0],
-                                   curr_scenario.time_windows)
+                                   curr_scenario.time_windows,
+                                   145)
     # Build Gurobi Model
     opt_route.build_model()
 
@@ -141,7 +146,8 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                    curr_scenario.requests[0],
                                    {req: req.utility for req in curr_scenario.requests[0]},
                                    curr_scenario.deltas[0],
-                                   curr_scenario.time_windows)
+                                   curr_scenario.time_windows,
+                                   145)
 
     # Build Gurobi Model
     det_model.build_model()

@@ -87,7 +87,8 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                 {0: accepted_requests + [curr_req]},
                                  curr_req,
                                  curr_scenario.deltas,
-                                 curr_scenario.time_windows)
+                                 curr_scenario.time_windows,
+                                 145)
 
         build_times_scenarios = model.build_models()
         build_times += build_times_scenarios
@@ -111,7 +112,8 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                    accepted_requests,
                                    {req: req.utility for req in accepted_requests},
                                    curr_scenario.deltas[0],
-                                   curr_scenario.time_windows)
+                                   curr_scenario.time_windows,
+                                   145)
     # Build Gurobi Model
     opt_route.build_model()
 
@@ -128,7 +130,8 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                    curr_scenario.requests[0],
                                    {req: req.utility for req in curr_scenario.requests[0]},
                                    curr_scenario.deltas[0],
-                                   curr_scenario.time_windows)
+                                   curr_scenario.time_windows,
+                                   145)
 
     # Build Gurobi Model
     det_model.build_model()
@@ -151,8 +154,10 @@ def run_decomp(json_files, walking_distance, util_value, seed):
     num_requests = len(curr_scenario.requests[0])
 
     # Calculate routing costs and serving profits
-    serving_profit = sum([opt_route.y[req].X * req.utility for req in accepted_requests])
-    serving_profit_deterministic = sum([det_model.y[req].X * req.utility for req in accepted_requests_deterministic])
+    serving_profit = sum([opt_route.y[req].X * req.utility
+                          for req in accepted_requests])
+    serving_profit_deterministic = sum([det_model.y[req].X * req.utility
+                                        for req in accepted_requests_deterministic])
     routing_online = opt_route.m.objVal - serving_profit
     routing_offline = det_model.m.objVal - serving_profit_deterministic
 

@@ -2,6 +2,8 @@ import gurobipy as grp
 from gurobipy import GRB
 from datetime import datetime, timedelta
 
+# from solver.scenario_decision_decomp_revision import combined_lazy_cb
+
 
 def subtourelim(model, where):
     if where == GRB.Callback.MIPSOL:
@@ -68,9 +70,53 @@ def subtour(used_edges, nodes):
 
     return subtours
 
+def combined_lazy_cb(model, where):
+    if where == GRB.Callback.MIPSOL:
+        # --- Subtour elimination ---
+        # make a list of edges selected in the solution
+        vals = model.cbGetSolution(model._vars)
+        selected = grp.tuplelist(edge for edge in model._edges
+                                 if vals[edge] > 0.5)
+        # find the shortest cycle in the selected edge list
+        subtours = subtour(selected, model._nodes)
+        if len(subtours) > 1:
+            for tour in subtours:
+                # add subtour elimination constr. for every pair of cities in subtour
+                model.cbLazy(grp.quicksum(model._vars[edge] for edge in tour)
+                             <= len(tour) - 1)
+                model._subtours.append(tour)
+
+        # --- Capacity propagation ---
+        # Loop over stops (exclude origin/destination if needed)
+        for stop in model._nodes:
+            if stop in (model._origin, model._dest):
+                continue
+
+            # Sum incoming k values
+            incoming_val = sum(model.cbGetSolution(model._k[(i, stop)])
+                               for (i, j) in model._edges if j == stop)
+            # Sum outgoing k values
+            outgoing_val = sum(model.cbGetSolution(model._k[(stop, j)])
+                               for (i, j) in model._edges if i == stop)
+
+            # Sum pickups / dropoffs at this stop
+            pickup_val = sum(model.cbGetSolution(model._p[(req, stop)])
+                             for req in model._requests if (req, stop) in model._p)
+            dropoff_val = sum(model.cbGetSolution(model._o[(req, stop)])
+                              for req in model._requests if (req, stop) in model._o)
+
+            # If violated, add lazy constraint
+            if abs((outgoing_val - incoming_val) - (pickup_val - dropoff_val)) > 1e-6:
+                incoming_expr = grp.quicksum(model._k[(i, stop)] for (i, j) in model._edges if j == stop)
+                outgoing_expr = grp.quicksum(model._k[(stop, j)] for (i, j) in model._edges if i == stop)
+                pickup_expr = grp.quicksum(model._p[(req, stop)] for req in model._requests if (req, stop) in model._p)
+                dropoff_expr = grp.quicksum(model._o[(req, stop)] for req in model._requests if (req, stop) in model._o)
+
+                model.cbLazy(outgoing_expr - incoming_expr == pickup_expr - dropoff_expr)
+
 
 class DeterministicModel:
-    def __init__(self, network, compulsory_stops, requests, utility, delta, time_windows):
+    def __init__(self, network, compulsory_stops, requests, utility, delta, time_windows, bus_capacity):
         self.network = network
         self.compulsory_stops = compulsory_stops
 
@@ -78,6 +124,7 @@ class DeterministicModel:
         self.utility = utility
         self.delta = delta  # {request: {'origin': {stop1: 0, stop2: 1}}, {'destination': {stop1: 1, stop2: 0}}}
         self.time_windows = time_windows
+        self.bus_capacity = bus_capacity
 
         # Model
         self.m = None
@@ -86,10 +133,15 @@ class DeterministicModel:
         self.x = None
         self.y = None
         self.t = None
+        self.k = None
+        self.p = None
+        self.o = None
 
         # Constraints
         self.stop_out = None
         self.stop_in = None
+        self.request_p = None
+        self.request_o = None
         self.flow_conservation = None
         self.flow_conservation_origin = None
         self.flow_conservation_destination = None
@@ -97,6 +149,10 @@ class DeterministicModel:
         self.time_window_a = None
         self.time_window_b = None
         self.out_flow = None
+        self.capacity_limit = None
+        self.picked_up_req = None
+        self.dropped_off_req = None
+        self.capacity_propagation = None
 
     def get_segment_edges(self, segment):
         return [(i, j) for (i, j) in self.network.edges() if segment in self.network[i][j]['segment']]
@@ -110,23 +166,45 @@ class DeterministicModel:
         # Variables
         self.x = {(i, j): self.m.addVar(vtype=GRB.BINARY, name=f'x_{(i, j)}', obj=-self.network[i][j]['weight'])
                   for (i, j) in self.network.edges()}
-        self.y = {req: self.m.addVar(vtype=GRB.BINARY, obj=self.utility[req]) for req in self.requests}
+        self.y = {req: self.m.addVar(vtype=GRB.BINARY, obj=self.utility[req])
+                  for req in self.requests}
+
         self.t = {stop: self.m.addVar(vtype=GRB.CONTINUOUS, name=f't_{stop}') for stop in self.compulsory_stops}
 
+        self.k = {(i, j): self.m.addVar(vtype=GRB.CONTINUOUS, name=f'k_{(i, j)}') for (i, j) in self.network.edges()}
+
+        self.p = {(req, i): self.m.addVar(vtype=GRB.BINARY, name=f'pickup_{(req, i)}')
+                       for req in self.requests
+                       for i in self.delta[req]['origin']}
+
+        self.o = {(req, j): self.m.addVar(vtype=GRB.BINARY, name=f'dropoff_{(req, j)}')
+                        for req in self.requests
+                        for j in self.delta[req]['destination']}
+
         # Constraints
-        self.stop_out = {req: self.m.addConstr(self.y[req] <=
+        self.stop_out = {(req, stop): self.m.addConstr(self.p[(req, stop)] <=
                                                grp.quicksum(self.x[arc]
-                                                            for stop in self.delta[req]['origin']
                                                             for arc in self.network.out_edges(stop)
                                                             ))
-                         for req in self.requests}
+                         for req in self.requests
+                         for stop in self.delta[req]['origin']}
 
-        self.stop_in = {req: self.m.addConstr(self.y[req] <=
+        self.stop_in = {(req, stop): self.m.addConstr(self.o[(req, stop)] <=
                                               grp.quicksum(self.x[arc]
-                                                           for stop in self.delta[req]['destination']
                                                            for arc in self.network.in_edges(stop)
                                                            ))
+                        for req in self.requests
+                        for stop in self.delta[req]['destination']}
+
+        self.request_p = {req: self.m.addConstr(grp.quicksum(self.p[(req, origin)]
+                                                            for origin in self.delta[req]['origin'])
+                                                     == self.y[req])
                         for req in self.requests}
+
+        self.request_o = {req: self.m.addConstr(grp.quicksum(self.o[(req, dest)]
+                                                             for dest in self.delta[req]['destination'])
+                                                == self.y[req])
+                          for req in self.requests}
 
         self.flow_conservation = {
             stop: self.m.addConstr(grp.quicksum(self.x[arc] for arc in self.network.out_edges(stop))
@@ -168,11 +246,26 @@ class DeterministicModel:
                                    <= 1, name=f'Out flow {stop}')
             for stop in self.network.nodes()}
 
+        self.capacity_limit = {
+            (i, j): self.m.addConstr(self.k[(i, j)] <= self.bus_capacity * self.x[(i, j)],
+                name=f'Capa_limit_{(i, j)}')
+            for (i, j) in self.network.edges()}
+
+        self.capacity_propagation = {
+            stop: self.m.addConstr(
+                grp.quicksum(self.k[(stop, dest)] for (stop, dest) in self.network.out_edges(stop)) ==
+                grp.quicksum(self.k[(origin, stop)] for (origin, stop) in self.network.in_edges(stop)) +
+                grp.quicksum(self.p[(req, stop)] for req in self.requests if (req, stop) in self.p) -
+                grp.quicksum(self.o[(req, stop)] for req in self.requests if (req, stop) in self.o),
+                name=f'Capa_prop_{stop}')
+            for stop in self.network.nodes() if stop not in (self.compulsory_stops[0], self.compulsory_stops[-1])}
+
+
     def solve(self):
         # Set objective to maximization
         self.m.Params.OutputFlag = 0
         self.m.ModelSense = -1
-        self.m.Params.TimeLimit = 2*60
+        self.m.Params.TimeLimit = 10*60
         self.m.Params.MIPGap = 0.01
 
         # Define attributes needed for subtour elimination
@@ -180,7 +273,12 @@ class DeterministicModel:
         self.m._nodes = self.network.nodes()
         self.m._edges = self.network.edges()
         self.m._origin = self.compulsory_stops[0]
+        self.m._dest = self.compulsory_stops[-1]
         self.m._subtours = list()
+        self.m._requests = self.requests
+        self.m._p = self.p
+        self.m._o = self.o
+        self.m._k = self.k
 
         # Enable lazy constraints
         self.m.Params.lazyConstraints = 1
