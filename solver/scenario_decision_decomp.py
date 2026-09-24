@@ -3,54 +3,6 @@ from gurobipy import GRB
 import time
 import math
 
-def combined_lazy_cb(model, where):
-    if where == GRB.Callback.MIPSOL:
-        # --- Save solution info ---
-        cur_obj = model.cbGet(grp.GRB.Callback.MIPSOL_OBJBST)
-        cur_bd = model.cbGet(grp.GRB.Callback.MIPSOL_OBJBND)
-        if model._obj != cur_obj or model._bd != cur_bd:
-            model._obj = cur_obj
-            model._bd = cur_bd
-            model._data.append([time.time() - model._start, cur_obj, cur_bd, abs((cur_bd - cur_obj)/cur_obj)])
-
-        # --- Subtour elimination ---
-        vals = model.cbGetSolution(model._vars)
-        selected = grp.tuplelist(edge for edge in model._edges if vals[edge] > 0.5)
-        subtours = subtour(selected)
-        if len(subtours) > 1:
-            for tour in subtours:
-                if tour not in model._subtours:
-                    for scenario in model._scenarios:
-                        model.cbLazy(grp.quicksum(model._vars[edge] for edge in tour) <= len(tour) - 1)
-                    model._subtours.append(tour)
-
-        # # --- Capacity propagation ---
-        # for stop in model._nodes:
-        #     if stop in (model._origin, model._dest):
-        #         continue
-        #
-        #     # Sum incoming k values
-        #     incoming_val = sum(model.cbGetSolution(model._k[(i, stop)])
-        #                        for (i, j) in model._edges if j == stop)
-        #     # Sum outgoing k values
-        #     outgoing_val = sum(model.cbGetSolution(model._k[(stop, j)])
-        #                        for (i, j) in model._edges if i == stop)
-        #
-        #     pickup_val = sum(model.cbGetSolution(model._p[(req, stop)])
-        #                      for req in model._requests if (req, stop) in model._p)
-        #     dropoff_val = sum(model.cbGetSolution(model._o[(req, stop)])
-        #                       for req in model._requests if (req, stop) in model._o)
-        #
-        #     # If violated, add lazy constraint
-        #     if abs((incoming_val - outgoing_val) - (pickup_val - dropoff_val)) > 1e-6:
-        #         incoming_expr = grp.quicksum(model._k[(i, stop)] for (i, j) in model._edges if j == stop)
-        #         outgoing_expr = grp.quicksum(model._k[(stop, j)] for (i, j) in model._edges if i == stop)
-        #         pickup_expr = grp.quicksum(model._p[(req, stop)] for req in model._requests if (req, stop) in model._p)
-        #         dropoff_expr = grp.quicksum(model._o[(req, stop)] for req in model._requests if (req, stop) in model._o)
-        #
-        #         model.cbLazy(incoming_expr - outgoing_expr == pickup_expr - dropoff_expr)
-
-
 def subtourelim(model, where):
     if where == GRB.Callback.MIPSOL:
         # Save data from new solution
@@ -63,48 +15,45 @@ def subtourelim(model, where):
             model._bd = cur_bd
             model._data.append([time.time() - model._start, cur_obj, cur_bd, abs((cur_bd - cur_obj) / cur_obj)])
 
-        # Find subtours in current solution and add respective lazy elimination constraints to the model
-        # make a list of edges selected in the solution
+        # make a list of arcs selected in the solution
         vals = model.cbGetSolution(model._vars)
+        selected = [arc for arc, val in vals.items() if val > 0.5]
 
-        # For each scenario, find all selected edges
-        selected = grp.tuplelist(edge for edge in model._edges if vals[edge] > 0.5)
-
-        # Find all subtours in each scenario
-        subtours = subtour(selected)
-
-        # Add a subtour elimination constraint to each scenario for each subtour
-        if len(subtours) > 1:
-            for tour in subtours:
-                if tour not in model._subtours:
-                    for scenario2 in model._scenarios:
-                        # add subtour elimination constr. for every pair of cities in subtour
-                        model.cbLazy(grp.quicksum(model._vars[edge] for edge in tour)
-                                     <= len(tour) - 1)
-                        model._subtours.append(tour)
+        # add a generalized subtour elimination constraint (GSEC) for every cycle and every stop k in it:
+        # sum_{(i, j) in A(S)} x_ij <= sum_{i in S \ {k}} v_i, where v_i = sum_{(i, j) in out(i)} x_ij (i visited)
+        # cycles never contain the destination, so the cut is valid for every origin -> destination route
+        for cycle in find_cycles(selected, model._origin):
+            stops = set(cycle)
+            inside_arcs = [(i, j) for i in cycle for (i, j) in model._out_arcs[i] if j in stops]
+            for k in cycle:
+                model.cbLazy(grp.quicksum(model._vars[arc] for arc in inside_arcs)
+                             <= grp.quicksum(model._vars[arc] for i in cycle if i != k for arc in model._out_arcs[i]))
+            model._subtours.append(cycle)
 
 
-def subtour(used_edges):
-    subtours = list()
+def find_cycles(selected, origin):
+    """Split the selected arcs of an integer solution into the origin -> destination path and the remaining cycles.
 
-    while len(used_edges) > 0:
-        tour_nodes = set([list(used_edges[0])[0], list(used_edges[0])[1]])
-        tour_edges = [used_edges[0]]
-        used_edges.remove(used_edges[0])
+    Every stop has at most one outgoing arc, flow is conserved at all stops except origin and destination, the origin
+    has no incoming and the destination no outgoing arcs. Hence, all selected arcs that are not on the path form
+    disjoint cycles. Returns the cycles as lists of stops."""
+    succ = dict(selected)
 
-        while True:
-            # next_edges = [edge for edge in used_edges if list(edge)[0] in tour_nodes or list(edge)[1] in tour_nodes]
-            next_edges = [edge for edge in used_edges if list(edge)[0] in tour_nodes]
-            for edge in next_edges:
-                tour_nodes.update(edge)
-                tour_edges.append(edge)
-                used_edges.remove(edge)
+    # Remove the origin -> destination path
+    node = origin
+    while node in succ:
+        node = succ.pop(node)
 
-            if len(next_edges) == 0:
-                subtours.append(tour_edges)
-                break
+    # All remaining arcs form disjoint cycles
+    cycles = list()
+    while succ:
+        node, cycle = next(iter(succ)), list()
+        while node in succ:
+            cycle.append(node)
+            node = succ.pop(node)
+        cycles.append(cycle)
 
-    return subtours
+    return cycles
 
 
 def data_cb(model, where):
@@ -118,45 +67,9 @@ def data_cb(model, where):
             model._bd = cur_bd
             model._data.append([time.time() - model._start, cur_obj, cur_bd, (cur_bd - cur_obj) / cur_obj])
 
-def lazy_capacity_cb(model, where):
-    if where == GRB.Callback.MIPSOL:
-        cur_obj = model.cbGet(grp.GRB.Callback.MIPSOL_OBJBST)
-        cur_bd = model.cbGet(grp.GRB.Callback.MIPSOL_OBJBND)
-
-        # Did objective value or best bound change?
-        if model._obj != cur_obj or model._bd != cur_bd:
-            model._obj = cur_obj
-            model._bd = cur_bd
-            model._data.append([time.time() - model._start, cur_obj, cur_bd, (cur_bd - cur_obj) / cur_obj])
-
-        c = 0
-        for stop in model._nodes:
-            if stop in (model._origin, model._dest):
-                continue
-
-            # Sum incoming k values
-            incoming_val = sum(model.cbGetSolution(model._k[(i, stop)])
-                               for (i, j) in model._edges if j == stop)
-            # Sum outgoing k values
-            outgoing_val = sum(model.cbGetSolution(model._k[(stop, j)])
-                               for (i, j) in model._edges if i == stop)
-
-            pickup_val = model.cbGetSolution(model._pickup[stop])
-            dropoff_val = model.cbGetSolution(model._dropoff[stop])
-
-            # If violated, add lazy constraint
-            if abs((outgoing_val - incoming_val) - (pickup_val - dropoff_val)) > 1e-6:
-                incoming_expr = grp.quicksum(model._k[(i, stop)] for (i, j) in model._edges if j == stop)
-                outgoing_expr = grp.quicksum(model._k[(stop, j)] for (i, j) in model._edges if i == stop)
-                pickup_expr = grp.quicksum(model._p[(req, stop)] for req in model._requests if (req, stop) in model._p)
-                dropoff_expr = grp.quicksum(model._o[(req, stop)] for req in model._requests if (req, stop) in model._o)
-
-                model.cbLazy(outgoing_expr - incoming_expr == pickup_expr - dropoff_expr)
-
-
 class ScenarioDecisionDecomp:
     def __init__(self, network, compulsory_stops, scenarios, accepted_requests, prev_requests, curr_request, deltas,
-                 time_windows, bus_capacity):
+                 time_windows, bus_capacity, accepted_stops=None):
         self.network = network
         self.compulsory_stops = compulsory_stops
         self.time_windows = time_windows
@@ -167,6 +80,7 @@ class ScenarioDecisionDecomp:
         self.curr_request = curr_request
         self.deltas = deltas  # {scenario: {request: {'origin': {stop1: 0, stop2: 1}}, {'destination': {stop1: 1, stop2: 0}}}}
         self.bus_capacity = bus_capacity
+        self.accepted_stops = accepted_stops if accepted_stops else dict()
 
         # Models
         self.models = dict()
@@ -178,6 +92,8 @@ class ScenarioDecisionDecomp:
         self.k = dict()
         self.p = dict()
         self.o = dict()
+        self.u = dict()
+        self.pickup_and_dropoff = dict()
         self.curr_request_y = None
 
         # Constraints
@@ -201,6 +117,12 @@ class ScenarioDecisionDecomp:
         self.picked_up_req = dict()
         self.dropped_off_req = dict()
         self.capacity_propagation = dict()
+        self.initial_capacity = dict()
+        self.invalid_pairs = dict()
+        self.order_propagation = dict()
+        self.pickup_and_dropoff_and = dict()
+        self.pickup_before_dropoff = dict()
+        self.fixed_stops_constraints = dict()
 
     def get_segment_edges(self, segment):
         # Not optimized
@@ -247,12 +169,25 @@ class ScenarioDecisionDecomp:
                 for req in self.prev_requests[scenario] if
                 req in self.accepted_requests}
 
+            # Serve previously accepted stops at their determined pickup/dropoff locations
+            self.fixed_stops_constraints[scenario] = dict()
+            for req, stops in self.accepted_stops.items():
+                if not stops:
+                    continue
+                pick, drop = stops
+                if (req, pick) in self.p[scenario] and (req, drop) in self.o[scenario]:
+                    self.fixed_stops_constraints[scenario][req] = (
+                        self.models[scenario].addConstr(self.p[scenario][(req, pick)] >= 1),
+                        self.models[scenario].addConstr(self.o[scenario][(req, drop)] >= 1)
+                    )
+
             # Scenario constraints
             self.add_stop_constraints(scenario)
             self.add_flow_conservation(scenario)
             self.add_time_constraints(scenario)
             self.add_out_constraints(scenario)
             self.add_capacity_constraints(scenario)
+            self.add_precedence_constraints(scenario)
             build_times.append(time.time() - t)
 
         if decision in [True, False]:
@@ -431,81 +366,92 @@ class ScenarioDecisionDecomp:
                 name=f'Capa_prop_{scenario}_{stop}')
             for stop in self.network.nodes() if stop not in (self.compulsory_stops[0], self.compulsory_stops[-1])}
 
-        # origin = self.compulsory_stops[0]
-        # self.initial_capacity[scenario] = {
-        #     self.models[scenario].addConstr(
-        #         grp.quicksum(self.k[scenario][(origin, dest)] for (origin, dest) in self.network.out_edges(origin)) == self.pickup[scenario][origin],
-        #     name= f'Initial_capacity_{scenario}')}
-        #
-        # dest = self.compulsory_stops[-1]
-        # self.final_capacity[scenario] = {
-        #     self.models[scenario].addConstr(
-        #         grp.quicksum(self.k[scenario][(stop, dest)] for (stop, dest) in self.network.in_edges(dest)) == 0,
-        #     name=f'Final_capacity_{scenario}')}
+        origin = self.compulsory_stops[0]
+        self.initial_capacity[scenario] = {
+            self.models[scenario].addConstr(
+                grp.quicksum(self.k[scenario][(origin, dest)] for (origin, dest) in self.network.out_edges(origin)) == 
+                grp.quicksum(self.p[scenario][(req,origin)] for req in self.prev_requests[scenario] if (req, origin) in self.p[scenario]),
+            name= f'Initial_capacity_{scenario}')}
 
-        # Node based capacity
-        # # each node’s pickup count
-        # self.picked_up_req[scenario] = {
-        #     stop: self.models[scenario].addConstr(
-        #         self.pickup[scenario][stop] ==
-        #         grp.quicksum(
-        #             self.y[scenario][(req, stop, l)]
-        #             for req in self.prev_requests[scenario]
-        #             if stop in self.deltas[scenario][req]['origin']
-        #             for l in self.deltas[scenario][req]['destination']
-        #         ),
-        #         name=f'Pickup_{scenario}_{stop}'
-        #     )
-        #     for stop in self.network.nodes()
-        # }
-        #
-        # # each node’s dropoff count
-        # self.dropped_off_req[scenario] = {
-        #     stop: self.models[scenario].addConstr(
-        #         self.dropoff[scenario][stop] ==
-        #         grp.quicksum(
-        #             self.y[scenario][(req, l, stop)]
-        #             for req in self.prev_requests[scenario]
-        #             if stop in self.deltas[scenario][req]['destination']
-        #             for l in self.deltas[scenario][req]['origin']
-        #         ),
-        #         name=f'Dropoff_{scenario}_{stop}'
-        #     )
-        #     for stop in self.network.nodes()
-        # }
-        #
-        # # load propagation constraints
-        # self.load_propagation[scenario] = {
-        #     (i, j): self.models[scenario].addConstr(
-        #         self.load[scenario][j] >=
-        #         self.load[scenario][i] + self.pickup[scenario][j] - self.dropoff[scenario][j]
-        #         - self.bus_capacity * (1 - self.x[scenario][(i, j)]),
-        #         name=f'Load_prop_lb_{scenario}_{(i, j)}'
-        #     )
-        #     for (i, j) in self.network.edges()
-        # }
-        #
-        # self.load_propagation2[scenario] = {
-        #     (i, j): self.models[scenario].addConstr(
-        #         self.load[scenario][j] <=
-        #         self.load[scenario][i] + self.pickup[scenario][j] - self.dropoff[scenario][j]
-        #         + self.bus_capacity * (1 - self.x[scenario][(i, j)]),
-        #         name=f'Load_prop_ub_{scenario}_{(i, j)}'
-        #     )
-        #     for (i, j) in self.network.edges()
-        # }
-        #
-        # # set initial load at the depot / origin
-        # self.models[scenario].addConstr(
-        #     self.load[scenario][self.compulsory_stops[0]] == 0,
-        #     name=f'Initial_load_{scenario}'
-        # )
+    def _stop_interval(self, stop):
+        if stop.is_compulsory:
+            pos = self.compulsory_stops.index(stop)
+            return pos, pos
+        return min(stop.segment) - 1, max(stop.segment)
+
+    def add_precedence_constraints(self, scenario):
+        self.invalid_pairs[scenario] = dict()
+        ordering_pairs = list()
+        affected_segments = set()
+
+        for req in self.prev_requests[scenario]:
+            for seg_p in self.deltas[scenario][req]['origin']:
+                low_p, high_p = self._stop_interval(seg_p)
+                for seg_o in self.deltas[scenario][req]['destination']:
+                    low_o, high_o = self._stop_interval(seg_o)
+                    if seg_p == seg_o or high_o <= low_p:
+                        self.invalid_pairs[scenario][(req, seg_p, seg_o)] = self.models[scenario].addConstr(
+                            self.p[scenario][(req, seg_p)] + self.o[scenario][(req, seg_o)] <= 1,
+                            name=f'Invalid_pair_{scenario}_{(req, seg_p, seg_o)}')
+                    elif high_p <= low_o:
+                        continue
+                    else:
+                        ordering_pairs.append((req, seg_p, seg_o))
+                        affected_segments.update(set(seg_p.segment) & set(seg_o.segment))
+
+        if not ordering_pairs:
+            self.u[scenario] = dict()
+            self.order_propagation[scenario] = dict()
+            self.pickup_and_dropoff[scenario] = dict()
+            self.pickup_and_dropoff_and[scenario] = dict()
+            self.pickup_before_dropoff[scenario] = dict()
+            return
+
+        order_arcs = set()
+        order_nodes = set()
+        for segment in affected_segments:
+            segment_arcs = self.get_segment_edges(segment)
+            order_arcs.update(segment_arcs)
+            order_nodes.update(node for arc in segment_arcs for node in arc)
+        for (req, seg_p, seg_o) in ordering_pairs:
+            order_nodes.update((seg_p, seg_o))
+
+        self.u[scenario] = {stop: self.models[scenario].addVar(vtype=GRB.CONTINUOUS, ub=len(order_nodes), name=f'u_{scenario}_{stop}')
+                            for stop in order_nodes}
+
+        self.order_propagation[scenario] = {
+            (i, j): self.models[scenario].addGenConstrIndicator(
+                self.x[scenario][(i, j)], True, self.u[scenario][j] - self.u[scenario][i] >= 1, name=f'Order_prop_{scenario}_{(i, j)}')
+                for (i, j) in order_arcs
+        }
+
+        self.pickup_and_dropoff[scenario] = {
+            (req, seg_p, seg_o): self.models[scenario].addVar(
+                vtype=GRB.BINARY, name=f'PickupDropoff_{scenario}_{(req, seg_p, seg_o)}')
+                for (req, seg_p, seg_o) in ordering_pairs
+        }
+
+        self.pickup_and_dropoff_and[scenario] = {
+            (req, seg_p, seg_o): self.models[scenario].addGenConstrAnd(
+                self.pickup_and_dropoff[scenario][(req, seg_p, seg_o)],
+                [self.p[scenario][(req, seg_p)], self.o[scenario][(req, seg_o)]],
+                name=f'PickupDropoffAnd_{scenario}_{(req, seg_p, seg_o)}')
+            for (req, seg_p, seg_o) in ordering_pairs
+        }
+
+        self.pickup_before_dropoff[scenario] = {
+            (req, seg_p, seg_o): self.models[scenario].addGenConstrIndicator(
+                self.pickup_and_dropoff[scenario][(req, seg_p, seg_o)], True, self.u[scenario][seg_o] - self.u[scenario][seg_p] >= 1,
+                name=f'PickupBeforeDropoff_{scenario}_{(req, seg_p, seg_o)}')
+            for (req, seg_p, seg_o) in ordering_pairs
+        }
 
     def solve(self, with_subtourelim=False):
         print(f'solving')
         solve_times = []
         num_scen = 0
         len_scenario = len(self.scenarios)
+        out_arcs = {stop: list(self.network.out_edges(stop)) for stop in self.network.nodes()}
         for scenario in self.scenarios:
             num_scen += 1
             print(f'solving scenario {num_scen} of {len_scenario}')
@@ -515,16 +461,14 @@ class ScenarioDecisionDecomp:
             self.models[scenario].Params.Threads = 2
             self.models[scenario].ModelSense = -1
             self.models[scenario].Params.TimeLimit = 10 * 60
-            self.models[scenario].Params.MIPGap = 0.03
+            self.models[scenario].Params.MIPGap = 0.01
 
             # Define attributes needed for subtour elimination
             self.models[scenario]._vars = self.x[scenario]
-            self.models[scenario]._nodes = self.network.nodes()
-            self.models[scenario]._edges = self.network.edges()
+            self.models[scenario]._out_arcs = out_arcs
             self.models[scenario]._origin = self.compulsory_stops[0]
             self.models[scenario]._dest = self.compulsory_stops[-1]
             self.models[scenario]._subtours = list()
-            self.models[scenario]._scenarios = self.scenarios.keys()
             self.models[scenario]._requests = self.prev_requests
             self.models[scenario]._p = self.p[scenario]
             self.models[scenario]._o = self.o[scenario]
@@ -563,6 +507,25 @@ class ScenarioDecisionDecomp:
     def get_accepted_requests_parallel(self, decisions):
         return self.accepted_requests + [self.curr_request] if sum(decisions) > len(
             self.scenarios) // 2 else self.accepted_requests
+
+    ### Majority vote across per scenario solutions for the pickup and dropoff locations of a request;
+    ### Tie breaker: highest average objective
+    ### Called right after solving with y_{\theta} = 1
+    def get_stop_assignment(self, request):
+        votes = dict()
+        objectives = dict()
+        for scenario in self.scenarios:
+            if self.models[scenario].SolCount == 0:
+                continue
+            pick = next((stop for (req, stop), var in self.p[scenario].items() if req == request and var.X > 0.5), None)
+            drop = next((stop for (req, stop), var in self.o[scenario].items() if req == request and var.X > 0.5), None)
+            if pick is not None and drop is not None:
+                votes[(pick, drop)] = votes.get((pick, drop), 0) + 1
+                objectives[(pick, drop)] = objectives.get((pick, drop), 0.0) + self.models[scenario].ObjVal
+        if not votes:
+            return None
+        return max(votes, key=lambda pair: (votes[pair], objectives[pair] / votes[pair]))
+
 
     def fix_decision(self, decision):
         for scenario in self.scenarios:

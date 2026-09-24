@@ -4,6 +4,8 @@ import generators.generate_multi_scenario as generate
 from solver.scenario_decision_decomp import ScenarioDecisionDecomp
 from solver.deterministic_arc_based import DeterministicModel
 import csv
+
+import time
 import numpy as np
 
 
@@ -55,6 +57,7 @@ def update_scenarios(curr_req, accepted_req, prev_scenarios, curr_scenario):
     return prev_scenarios
 
 def run_decomp(json_files, walking_distance, util_value, seed):
+    bus_capacity = 145
     request_file = json_files.pop(1)
     curr_scenario = generate.get_instance([request_file], walking_distance, 1)
     prev_scenarios = generate.get_instance(json_files, walking_distance, 1)
@@ -67,28 +70,33 @@ def run_decomp(json_files, walking_distance, util_value, seed):
     for scenario in prev_scenarios.requests:
         prev_scenarios.requests[scenario].sort(key=lambda x: x.request_time)
 
-    accepted_requests = list()
+    # {request: (pickup_stop, dropoff_stop)}
+    accepted_requests = dict()
 
     build_times = []
     solve_times = []
+    decision_times = []
 
     # For each request in the current scenario, solve the corresponding stochastic program
     i = 0
     print('----------------------- Solver information -----------------------')
+    run_start = time.time()
     for curr_req in curr_scenario.requests[0]:
         print(f'Determine whether to accept or reject request {i}')
         i += 1
+        start_time = time.time()
         update_scenarios(curr_req, accepted_requests, prev_scenarios, curr_scenario)
 
         model = ScenarioDecisionDecomp(prev_scenarios.network,
                                  prev_scenarios.compulsory_stops,
                                  prev_scenarios.scenarios,
-                                 accepted_requests,
+                                 list(accepted_requests),
                                  prev_scenarios.requests,
                                  curr_req,
                                  prev_scenarios.deltas,
                                  prev_scenarios.time_windows,
-                                 145)
+                                 bus_capacity,
+                                 accepted_stops=accepted_requests)
 
 
         build_times_scenarios = model.build_models()
@@ -98,28 +106,30 @@ def run_decomp(json_files, walking_distance, util_value, seed):
         solve_times_scenarios = model.solve(True)
         solve_times += solve_times_scenarios
 
-        # If request is accepted, add it to list of accepted requests
+        # If request is accepted, store it together with its assigned pickup and dropoff stops
         new_accepted_requests = model.get_accepted_requests()
         if len(new_accepted_requests) > len(accepted_requests):
-            accepted_requests = new_accepted_requests
+            accepted_requests[curr_req] = model.get_stop_assignment(curr_req)
             print('--- Accepted request ---')
         else:
             print('--- Rejected request ---')
+
+        decision_times.append(time.time() - start_time)
 
 
     ############################ Get optimal route with all accepted requests ############################
     opt_route = DeterministicModel(curr_scenario.network,
                                    curr_scenario.compulsory_stops,
-                                   accepted_requests,
+                                   list(accepted_requests),
                                    {req: req.utility for req in accepted_requests},
                                    curr_scenario.deltas[0],
                                    curr_scenario.time_windows,
-                                   145)
+                                   bus_capacity)
     # Build Gurobi Model
     opt_route.build_model()
 
-    # Accept all accepted requests in Gurobi Model
-    opt_route.force_request_accept(accepted_requests)
+    # Accept all accepted requests in Gurobi Model at their assigned stops
+    opt_route.force_request_accept(list(accepted_requests), fixed_stops=accepted_requests)
 
     # Solve opt_route
     opt_route.solve()
@@ -132,7 +142,7 @@ def run_decomp(json_files, walking_distance, util_value, seed):
                                    {req: req.utility for req in curr_scenario.requests[0]},
                                    curr_scenario.deltas[0],
                                    curr_scenario.time_windows,
-                                   145)
+                                   bus_capacity)
 
     # Build Gurobi Model
     det_model.build_model()
@@ -144,61 +154,73 @@ def run_decomp(json_files, walking_distance, util_value, seed):
     accepted_requests_deterministic = det_model.get_served_requests()
 
     ########################### Save data from online and offline model ###########################
+    print('----------------------- Solution information -----------------------')
+    result_folder = 'results'
+    if not os.path.exists(result_folder):
+        os.makedirs(result_folder)
+    total_objective_online = opt_route.m.objVal
+    total_objective_offline = det_model.m.objVal
 
-    # Determine parameters
+    def get_visited_stops(model):
+        next_stop = {i: j for (i, j), var in model.x.items() if var.X > 0.5}
+        stop = model.compulsory_stops[0]
+        visited = []
+        while stop is not None:
+            visited.append(str(stop.id))
+            stop = next_stop.get(stop)
+        return ';'.join(visited)
+
+    visited_stops_online = get_visited_stops(opt_route)
+    visited_stops_offline = get_visited_stops(det_model)
+
+    travel_time_online = opt_route.t[opt_route.compulsory_stops[-1]].X
+    travel_time_offline = det_model.t[det_model.compulsory_stops[-1]].X
+
+    # The generator already removed all requests without a stop within walking distance
+    num_requests = len(curr_scenario.requests[0])
+    num_solved = len(accepted_requests)
+    total_run_time = round(time.time() - run_start, 2)
+
+    print("----------------------------------------------------------------------")
+    print(f'Number of solved requests: {num_solved}')
+    print(f'Number of rejected requests: {num_requests - num_solved}')
+    print(f'Number of solved requests in deterministic model: {len(accepted_requests_deterministic)}')
+    print(f'Number of rejected requests in deterministic model: {num_requests - len(accepted_requests_deterministic)}')
+    print(f'Number of feasible requests: {num_requests}')
+    print(f'Average decision time: {round(np.nanmean(decision_times), 2)} seconds')
+    print(f'Min Decision Time: {min(decision_times)}, max decision time: {max(decision_times)}')
+    print(f'Average build time: {round(np.nanmean(build_times), 2)} seconds')
+    print(f'Average solve time: {round(np.nanmean(solve_times), 2)} seconds')
+    print(f'Total run time: {total_run_time} seconds')
+    print(f'Total objective online: {total_objective_online}')
+    print(f'Total objective offline: {total_objective_offline}')
+    print(f'Travel time online: {travel_time_online}')
+    print(f'Travel time offline: {travel_time_offline}')
+
+    data_head = ['feasible_requests', 'num_solved_requests_online', 'num_solved_requests_offline', 'avg_decision_time', 'min_decision_time', 'max_decision_time',
+                 'avg_build_time', 'avg_solve_time',
+                 'total_run_time', 'total_objective_online', 'total_objective_offline',
+                 'travel_time_online', 'travel_time_offline',
+                 'visited_stops_online', 'visited_stops_offline']
+    data = [num_requests, num_solved, len(accepted_requests_deterministic), round(np.nanmean(decision_times), 2), min(decision_times), max(decision_times),
+            round(np.nanmean(build_times), 2), round(np.nanmean(solve_times), 2),
+            total_run_time, total_objective_online, total_objective_offline,
+            travel_time_online, travel_time_offline,
+            visited_stops_online, visited_stops_offline]
+
+    # Save data to csv file
     route = curr_scenario.data['route_name']
     route_time = curr_scenario.data['parameters']['erste_abzeit_text']
     route_time_text = route_time.replace(':', '_')
-    comp_stops = len(curr_scenario.compulsory_stops)
     comp_perc = curr_scenario.data['parameters']['compulsory_percentage']
     num_scenarios = len(json_files)
-    num_requests = len(curr_scenario.requests[0])
 
-    # Calculate routing costs and serving profits
-    serving_profit = sum([opt_route.y[req].X * req.utility
-                          for req in accepted_requests])
-    serving_profit_deterministic = sum([det_model.y[req].X * req.utility
-                                        for req in accepted_requests_deterministic])
-    routing_online = opt_route.m.objVal - serving_profit
-    routing_offline = det_model.m.objVal - serving_profit_deterministic
+    #   online_algorithm_<method>_<route>_<departure>_<csf>_walk<wd>_n<N>_<seed>_summary.csv
+    model_tag = f'walk{walking_distance}_n{num_scenarios}'
 
-    # Caluclate travel times
-    travel_time = opt_route.t[opt_route.compulsory_stops[-1]].X
-    travel_time_deterministic = det_model.t[det_model.compulsory_stops[-1]].X
-
-    data_head = ['route', 'route_time', 'comp_stops', 'comp_stops_perc', 'utility', 'walking_distance', 'num_scenarios',
-                 'num_requests', 'served_requests', 'served_requests_deterministic', 'objective', 'objective_deterministic',
-                 'solve_times', 'build_times', 'routing_cost', 'routing_cost_deterministic', 'serving_profit',
-                 'serving_profit_deterministic', 'travel_time', 'travel_time_deterministic']
-
-    data = [route, route_time, comp_stops, comp_perc, util_value, walking_distance, num_scenarios, num_requests,
-            len(accepted_requests), len(accepted_requests_deterministic), opt_route.m.objVal, det_model.m.objVal,
-            solve_times, build_times, routing_online, routing_offline, serving_profit, serving_profit_deterministic,
-            travel_time, travel_time_deterministic]
-
-
-
-    with open(f'results/online_algorithm_TS_heuristic_decomp_{route}_{route_time_text}_{comp_perc}_{num_scenarios}_{seed}.csv',
-              'w') as f:
+    file_path = (result_folder + '/online_algorithm_TS_heuristic_decomp_' +
+                 f'{route}_{route_time_text}_{comp_perc}_{model_tag}_{seed}_summary.csv')
+    with open(file_path, 'w') as f:
         writer = csv.writer(f)
         writer.writerows([data_head, data])
-
-    # Calculate serial computation times
-    serial_solve_times = []
-    for i in range(0, len(solve_times), 2):
-        serial_solve_times.append(sum(solve_times[i:i + 2]))
-
-
-
-
-    # Print relevant information
-    print('----------------------- Solution information -----------------------')
-    print(f'Accepted requests: {len(accepted_requests)}')
-    print(f'Rejected requests: {num_requests - len(accepted_requests)}')
-    print(f'Revenue: {round(opt_route.m.objVal, 2)}')
-    print(f'Average request response time (serial): {round(np.nanmean(serial_solve_times), 2)} seconds')
-    print(f'Average request response time (parallel): {round(np.nanmean(solve_times), 2)} seconds')
-    print(f'Routing cost: {round(routing_online, 2)}')
-    print(f'Travel time: {round(travel_time, 2)}')
-
     return
