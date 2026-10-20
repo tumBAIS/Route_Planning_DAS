@@ -446,7 +446,7 @@ class ScenarioDecisionDecomp:
             for (req, seg_p, seg_o) in ordering_pairs
         }
 
-    def solve(self, with_subtourelim=False):
+    def solve(self, with_subtourelim=False, stop_on_infeasible=False):
         print(f'solving')
         solve_times = []
         num_scen = 0
@@ -489,6 +489,12 @@ class ScenarioDecisionDecomp:
             # self.models[scenario]._data.append([time.time() - self.models[scenario]._start, self.models[scenario].objVal, self.models[scenario].ObjBound, self.models[scenario].MIPGap])
             solve_times.append(time.time() - t)
 
+            if stop_on_infeasible and self.models[scenario].SolCount == 0:
+                print(f'No solution for scenario {scenario} (status {self.models[scenario].status}), '
+                      f'skipping the remaining {len_scenario - num_scen} scenarios')
+                solve_times += [0.0] * (len_scenario - num_scen)
+                break
+
         return solve_times
 
     def get_avg_served_req(self):
@@ -497,6 +503,10 @@ class ScenarioDecisionDecomp:
     def get_accepted_requests(self):
         count_accepted = 0
         for scenario in self.scenarios:
+            # No solution found within the time limit or model infeasible: count the scenario as a rejection
+            if self.models[scenario].SolCount == 0:
+                print(f'No solution for scenario {scenario} (status {self.models[scenario].status}), counted as reject')
+                continue
             y = self.y[scenario][self.curr_request].X
             if 0.5 > y > 0:
                 y = 0
@@ -536,11 +546,42 @@ class ScenarioDecisionDecomp:
                 # Force all y_vars to 0 (reject the request)
                 self.models[scenario].addConstr(self.y[scenario][self.curr_request] <= 0, name=f'Fix decision')
 
+    def switch_to_reject(self):
+        # Set start from solved accept without the current request, fix current request to reject
+        switch_times = []
+        for scenario in self.scenarios:
+            t = time.time()
+            model = self.models[scenario]
+            start = dict()
+            if model.SolCount > 0:
+                start = {var: var.X for var in model.getVars()}
+                # vehicle loads changed without current request, recompute loads
+                for var in self.k[scenario].values():
+                    start[var] = GRB.UNDEFINED
+                start[self.y[scenario][self.curr_request]] = 0
+                for (req, _), var in list(self.p[scenario].items()) + list(self.o[scenario].items()):
+                    if req == self.curr_request:
+                        start[var] = 0
+                for (req, _, _), var in self.pickup_and_dropoff[scenario].items():
+                    if req == self.curr_request:
+                        start[var] = 0
+
+            model.remove(model.getConstrByName('Fix decision'))
+            model.addConstr(self.y[scenario][self.curr_request] <= 0, name=f'Fix decision')
+            if start:
+                model.setAttr('Start', list(start), list(start.values()))
+            switch_times.append(time.time() - t)
+        return switch_times
+
     def get_objectives_fix_decision(self):
         # Check that all scenarios are feasible (we can break after the first scenario because of theorem 3.1)
         for scenario in self.scenarios:
             # print(f'Model status {self.models[scenario].status}')
             if self.models[scenario].status == 3:
+                return -math.inf
+            # No solution found within the time limit: treat like infeasibility
+            if self.models[scenario].SolCount == 0:
+                print(f'No solution for scenario {scenario} (status {self.models[scenario].status}), treated as infeasible')
                 return -math.inf
 
         return sum(self.models[scenario].ObjVal for scenario in self.scenarios)

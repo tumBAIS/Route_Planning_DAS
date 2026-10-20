@@ -15,6 +15,7 @@ if __name__ == "__main__":
     util_value = int(sys.argv[6]) # 750
     algorithm = sys.argv[7] # exact, heuristic, or greedy
     seed = int(sys.argv[8]) # integer
+    bus_capacity = int(sys.argv[9]) if len(sys.argv) > 9 else 145 # optional
 
     # Pull num_scenarios random scenarios out of our sample set of 50 scenarios with a fixed seed
     random.seed(seed)
@@ -31,12 +32,12 @@ if __name__ == "__main__":
     if algorithm == 'exact':
 
         # Run Stochastic Programs in a rolling horizon algorithm
-        run_decision_decomp_exact.run_decomp(json_files, walking_distance, util_value, seed)
+        run_decision_decomp_exact.run_decomp(json_files, walking_distance, util_value, seed, bus_capacity)
 
     elif algorithm == 'heuristic':
         # Run Stochastic Programs in a rolling horizon algorithm
-        run_decision_decomp_heuristic.run_decomp(json_files, walking_distance, util_value, seed)
+        run_decision_decomp_heuristic.run_decomp(json_files, walking_distance, util_value, seed, bus_capacity)
 
     elif algorithm == 'greedy':
         # Run Stochastic Programs in a rolling horizon algorithm
-        run_decision_decomp_greedy.run_decomp(json_files, walking_distance, util_value, seed)
+        run_decision_decomp_greedy.run_decomp(json_files, walking_distance, util_value, seed, bus_capacity)

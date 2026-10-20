@@ -56,8 +56,7 @@ def update_scenarios(curr_req, accepted_req, prev_scenarios, curr_scenario):
 
     return prev_scenarios
 
-def run_decomp(json_files, walking_distance, util_value, seed):
-    bus_capacity = 145
+def run_decomp(json_files, walking_distance, util_value, seed, bus_capacity=145):
     request_file = json_files.pop(1)
     curr_scenario = generate.get_instance([request_file], walking_distance, 1)
     prev_scenarios = generate.get_instance(json_files, walking_distance, 1)
@@ -155,9 +154,6 @@ def run_decomp(json_files, walking_distance, util_value, seed):
 
     ########################### Save data from online and offline model ###########################
     print('----------------------- Solution information -----------------------')
-    result_folder = 'results'
-    if not os.path.exists(result_folder):
-        os.makedirs(result_folder)
     total_objective_online = opt_route.m.objVal
     total_objective_offline = det_model.m.objVal
 
@@ -175,6 +171,50 @@ def run_decomp(json_files, walking_distance, util_value, seed):
 
     travel_time_online = opt_route.t[opt_route.compulsory_stops[-1]].X
     travel_time_offline = det_model.t[det_model.compulsory_stops[-1]].X
+
+    def get_walking_distances(model):
+        # Per served request: origin building to pickup stop plus dropoff stop to destination building
+        distances = curr_scenario.data['buildings_distance_matrix']
+        walking = {req: 0 for req in model.get_served_requests()}
+        for (req, stop), var in model.p.items():
+            if req in walking and var.X > 0.5:
+                walking[req] += distances[req.origin['trip_id'] * 2][stop.order]
+        for (req, stop), var in model.o.items():
+            if req in walking and var.X > 0.5:
+                walking[req] += distances[req.origin['trip_id'] * 2 + 1][stop.order]
+        return [round(dist, 2) for dist in walking.values()]
+
+    walking_distances_online = get_walking_distances(opt_route)
+    walking_distances_offline = get_walking_distances(det_model)
+
+    def get_stop_assignment(model):
+        # Per served request: (trip_id, pickup stop, dropoff stop)
+        assignment = {req: [req.origin['trip_id'], None, None] for req in model.get_served_requests()}
+        for (req, stop), var in model.p.items():
+            if req in assignment and var.X > 0.5:
+                assignment[req][1] = stop.id
+        for (req, stop), var in model.o.items():
+            if req in assignment and var.X > 0.5:
+                assignment[req][2] = stop.id
+        return [tuple(a) for a in assignment.values()]
+
+    def get_loads(model):
+        # Passengers on board per driven segment, loads[i] between visited stops i and i + 1
+        next_stop = {i: j for (i, j), var in model.x.items() if var.X > 0.5}
+        stop = model.compulsory_stops[0]
+        loads = []
+        while stop in next_stop:
+            loads.append(round(model.k[(stop, next_stop[stop])].X))
+            stop = next_stop[stop]
+        return loads
+
+    stop_assignment_online = get_stop_assignment(opt_route)
+    stop_assignment_offline = get_stop_assignment(det_model)
+    loads_online = get_loads(opt_route)
+    loads_offline = get_loads(det_model)
+
+    avg_walking_distance_online = round(np.mean(walking_distances_online), 2) if walking_distances_online else np.nan
+    avg_walking_distance_offline = round(np.mean(walking_distances_offline), 2) if walking_distances_offline else np.nan
 
     # The generator already removed all requests without a stop within walking distance
     num_requests = len(curr_scenario.requests[0])
@@ -196,17 +236,32 @@ def run_decomp(json_files, walking_distance, util_value, seed):
     print(f'Total objective offline: {total_objective_offline}')
     print(f'Travel time online: {travel_time_online}')
     print(f'Travel time offline: {travel_time_offline}')
+    print(f'Average walking distance online: {avg_walking_distance_online}')
+    print(f'Average walking distance offline: {avg_walking_distance_offline}')
 
     data_head = ['feasible_requests', 'num_solved_requests_online', 'num_solved_requests_offline', 'avg_decision_time', 'min_decision_time', 'max_decision_time',
                  'avg_build_time', 'avg_solve_time',
                  'total_run_time', 'total_objective_online', 'total_objective_offline',
                  'travel_time_online', 'travel_time_offline',
-                 'visited_stops_online', 'visited_stops_offline']
+                 'avg_walking_distance_online', 'avg_walking_distance_offline',
+                 'visited_stops_online', 'visited_stops_offline',
+                 # Per subproblem in solve order, combine_csv.py derives the serial and parallel time per request
+                 'build_times', 'solve_times',
+                 # Per served request in request order
+                 'walking_distances_online', 'walking_distances_offline',
+                 'stop_assignment_online', 'stop_assignment_offline',
+                 # Per segment of visited_stops
+                 'loads_online', 'loads_offline']
     data = [num_requests, num_solved, len(accepted_requests_deterministic), round(np.nanmean(decision_times), 2), min(decision_times), max(decision_times),
             round(np.nanmean(build_times), 2), round(np.nanmean(solve_times), 2),
             total_run_time, total_objective_online, total_objective_offline,
             travel_time_online, travel_time_offline,
-            visited_stops_online, visited_stops_offline]
+            avg_walking_distance_online, avg_walking_distance_offline,
+            visited_stops_online, visited_stops_offline,
+            build_times, solve_times,
+            walking_distances_online, walking_distances_offline,
+            stop_assignment_online, stop_assignment_offline,
+            loads_online, loads_offline]
 
     # Save data to csv file
     route = curr_scenario.data['route_name']
@@ -215,8 +270,15 @@ def run_decomp(json_files, walking_distance, util_value, seed):
     comp_perc = curr_scenario.data['parameters']['compulsory_percentage']
     num_scenarios = len(json_files)
 
-    #   online_algorithm_<method>_<route>_<departure>_<csf>_walk<wd>_n<N>_<seed>_summary.csv
+    # Group results by algorithm, walking distance, and compulsory stop percentage
+    result_folder = os.path.join('results', 'heuristic', str(walking_distance), str(comp_perc))
+    os.makedirs(result_folder, exist_ok=True)
+
+    #   online_algorithm_<method>_<route>_<departure>_<csf>_walk<wd>_n<N>[_cap<C>]_<seed>_summary.csv
     model_tag = f'walk{walking_distance}_n{num_scenarios}'
+    # Only tag non-default capacities, so default runs keep their file names
+    if bus_capacity != 145:
+        model_tag += f'_cap{bus_capacity}'
 
     file_path = (result_folder + '/online_algorithm_TS_heuristic_decomp_' +
                  f'{route}_{route_time_text}_{comp_perc}_{model_tag}_{seed}_summary.csv')
